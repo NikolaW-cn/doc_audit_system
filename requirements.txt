@@ -8,5 +8,6 @@ pytesseract
 Pillow
 streamlit
 rapidocr_onnxruntime
+streamlit-pdf-viewer
 # paddleocr 
 # paddlepaddle
