@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import tempfile
 import shutil
-import base64  # <--- 1. 新增：我们需要这个库来处理 PDF 预览
+from streamlit_pdf_viewer import pdf_viewer 
 
 # === 导入共用核心模块 ===
 try:
@@ -17,14 +17,7 @@ st.set_page_config(page_title="智能文档审计系统", layout="wide", page_ic
 
 st.title("📄 智能文档审计系统 (Web版)")
 
-# === 辅助函数：显示 PDF ===
-def show_pdf(file_path):
-    """读取 PDF 并嵌入网页进行预览"""
-    with open(file_path, "rb") as f:
-        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    # 使用 iframe 嵌入 PDF，宽高可调
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
+# (❌ 原来的 show_pdf 函数删掉，不再需要了)
 
 # === 侧边栏配置 ===
 with st.sidebar:
@@ -99,7 +92,6 @@ if uploaded_file:
                         
                         st.markdown("### 📄 结果预览")
                         
-                        # --- 2. 关键修改：增加 PDF 预览分支 ---
                         if output_path.endswith(".html"):
                             with open(output_path, "r", encoding="utf-8") as f:
                                 st.components.v1.html(f.read(), height=600, scrolling=True)
@@ -109,14 +101,17 @@ if uploaded_file:
                                 st.markdown(f.read())
                         
                         elif output_path.endswith(".pdf"):
-                            # 调用刚才定义的函数显示 PDF
-                            show_pdf(output_path)
-                        # ------------------------------------
+                            # ✅ 使用新库进行预览 (它把PDF渲染成图片，Chrome 不会拦截)
+                            # width 设置为 800 或更大以适应宽屏
+                            pdf_viewer(input=output_path, width=800, height=1000)
 
                     else:
                         st.error("❌ 转换失败，请检查文件内容或日志。")
 
                 except Exception as e:
                     st.error(f"发生系统错误: {e}")
+                    # 打印详细堆栈方便调试
+                    import traceback
+                    st.text(traceback.format_exc())
 else:
     st.info("👈 请先在左侧侧边栏上传文件")

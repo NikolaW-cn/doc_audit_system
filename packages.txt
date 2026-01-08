@@ -7,3 +7,4 @@ libffi-dev
 shared-mime-info
 fonts-noto-cjk
 fonts-wqy-zenhei
+streamlit-pdf-viewer
