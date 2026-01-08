@@ -1,8 +1,10 @@
 import os
+import sys
 import fitz  # PyMuPDF
 from markdownify import markdownify as md_converter
 import markdown
 from weasyprint import HTML, CSS
+from contextlib import contextmanager
 
 class PdfMdConverter:
     """
@@ -77,15 +79,15 @@ class PdfMdConverter:
             css_style = CSS(string='''
                 @page { size: A4; margin: 2.5cm; }
                 body { 
-                    font-family: "Microsoft YaHei", "SimHei", sans-serif; 
+                    /* 关键修改：增加了 "Noto Sans CJK SC" 和 "WenQuanYi Zen Hei" */
+                    font-family: "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei", sans-serif;
                     font-size: 11pt; 
                     line-height: 1.6;
                     color: #333;
                 }
+                /* ... 其他样式保持不变 ... */
                 h1, h2, h3 { color: #2c3e50; margin-top: 1em; }
                 h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }
-                
-                /* 表格样式 */
                 table { 
                     border-collapse: collapse; 
                     width: 100%; 
@@ -97,12 +99,8 @@ class PdfMdConverter:
                     padding: 8px 12px; 
                 }
                 th { background-color: #f8f9fa; font-weight: bold; }
-                
-                /* 代码块样式 */
                 pre { background: #f6f8fa; padding: 10px; border-radius: 4px; }
                 code { font-family: Consolas, monospace; background: #f0f0f0; padding: 2px 4px; }
-
-                /* 关键：高亮样式 (未来使用) */
                 mark, .highlight { 
                     background-color: #ffe066; 
                     padding: 2px 0;
