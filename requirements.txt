@@ -1,0 +1,17 @@
+#PDF 处理库 (PyMuPDF)
+pymupdf
+
+#Markdown 与 HTML 互转
+markdownify
+markdown
+
+#HTML 转 PDF (支持 CSS 样式)
+weasyprint
+
+#Word (docx) 转 HTML
+mammoth
+
+#OCR 相关 (后续步骤会用到)
+pdf2image
+pytesseract
+Pillow
