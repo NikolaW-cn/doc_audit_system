@@ -11,29 +11,23 @@ class PdfMdConverter:
         pass
 
     # =========================================================================
-    # 1. PDF -> Markdown (V6.0 通用防御版)
-    # 核心升级：引入“正文保护机制”，防止误删边缘的正文内容
+    # 1. PDF -> Markdown (V7.0 表格校验 + 粘连解离版)
     # =========================================================================
     def pdf_to_markdown(self, pdf_path, output_path):
         try:
             doc = fitz.open(pdf_path)
             total_pages = len(doc)
             
-            # --- 阶段一：全书扫描 (建立特征库 & 确定正文基准) ---
-            
-            all_font_sizes = []
+            # --- 步骤 A: 建立页眉页脚特征库 ---
             text_frequency = Counter()
+            all_font_sizes = []
             
-            # 临时存储所有块，避免二次读取 IO
-            all_pages_blocks = []
-
+            # 预扫描全书
             for page in doc:
-                blocks = page.get_text("dict")["blocks"]
-                all_pages_blocks.append(blocks)
                 page_height = page.rect.height
-                
+                blocks = page.get_text("dict")["blocks"]
                 for b in blocks:
-                    if b['type'] == 0: # 文本块
+                    if b['type'] == 0:
                         for line in b["lines"]:
                             # 1. 收集字号
                             for span in line["spans"]:
@@ -48,50 +42,54 @@ class PdfMdConverter:
                             
                             # 判定区域：上下 20%
                             if y_center < page_height * 0.20 or y_center > page_height * 0.80:
-                                # 归一化：去空格、去数字、转小写
+                                # 归一化处理
                                 clean_key = re.sub(r'[\d\s]+', '', text).lower()
                                 if clean_key:
                                     text_frequency[clean_key] += 1
 
-            # A. 计算“正文基准字号” (出现次数最多的字号)
-            if all_font_sizes:
-                body_font_size = Counter(all_font_sizes).most_common(1)[0][0]
-            else:
-                body_font_size = 10.5
+            # 计算正文基准字号
+            body_font_size = Counter(all_font_sizes).most_common(1)[0][0] if all_font_sizes else 10.5
             
-            print(f"🛡️ 正文保护机制已启动，基准字号: {body_font_size}pt")
-
-            # B. 建立高频页眉库 (出现频率 > 30% 且位于边缘)
+            # 筛选高频特征 (频率 > 30%)
             hf_candidates = {
                 key for key, count in text_frequency.items() 
                 if count > (total_pages * 0.3)
             }
-
-            # --- 阶段二：逐页提取 (带防御逻辑) ---
             
+            print(f"🕵️ 特征库: {list(hf_candidates)[:5]}...") # 打印前5个看看
+
+            # --- 步骤 B: 逐页提取 ---
             md_content = ""
             extracted_headers = set()
             extracted_footers = set()
             
-            # 增强版页码正则
+            # 页码正则
             PAGE_NUM_PATTERNS = [
-                r'^\d+$',                      # 1
-                r'^\-?\s*\d+\s*\-?$',          # - 1 -
-                r'^Page\s*\d+',                # Page 1
-                r'^\d+\s*[\/\|\-]\s*\d+$',     # 1/10, 1 | 10
-                r'^\d+\s*of\s*\d+$',           # 1 of 10
-                r'^第\s*\d+\s*页$',             # 第 1 页
-                r'^\d+\s*\/\s*\d+$'            # 1 / 7
+                r'^\d+$', r'^\-?\s*\d+\s*\-?$', r'^Page\s*\d+', 
+                r'^\d+\s*[\/\|\-]\s*\d+$', r'^\d+\s*of\s*\d+$',
+                r'^第\s*\d+\s*页$', r'^\d+\s*\/\s*\d+$'
             ]
 
             for i, page in enumerate(doc):
                 page_height = page.rect.height
                 
-                # 1. 表格提取 (坚持 strategy='lines' 以保安全)
-                # 只有看到明确边框才认为是表格，防止把对齐的文本误判
+                # 1. 表格提取 (带合法性校验)
                 tables = page.find_tables(strategy='lines')
-                table_bboxes = [fitz.Rect(tab.bbox) for tab in tables]
-                page_tables_md = {tab.bbox[1]: tab.to_markdown() for tab in tables}
+                page_tables_md = {}
+                table_bboxes = []
+                
+                for tab in tables:
+                    # --- 🛑 表格合法性校验 (防止标题变表格) ---
+                    # 规则1: 如果表格只有1行，且列数>3，大概率是标题被拆分了 -> 丢弃
+                    if tab.row_count == 1 and tab.col_count > 3:
+                        continue
+                    # 规则2: 如果表格几乎是空的 -> 丢弃
+                    if len(tab.extract()) < 1:
+                        continue
+                    
+                    # 通过校验，认为是真表格
+                    table_bboxes.append(fitz.Rect(tab.bbox))
+                    page_tables_md[tab.bbox[1]] = tab.to_markdown()
 
                 page_elements = []
                 # 加入表格
@@ -99,19 +97,14 @@ class PdfMdConverter:
                     page_elements.append({"y": y, "type": "table", "content": md_text})
 
                 # 2. 文本提取
-                blocks = all_pages_blocks[i] # 使用缓存
+                blocks = page.get_text("dict")["blocks"]
                 
                 for b in blocks:
                     if b['type'] == 0:
-                        # 表格避让机制
+                        # 表格避让
                         block_rect = fitz.Rect(b["bbox"])
-                        # 如果文本块重心在表格里，跳过
-                        is_in_table = False
-                        for t_rect in table_bboxes:
-                            if block_rect.intersect(t_rect).get_area() > block_rect.get_area() * 0.5:
-                                is_in_table = True
-                                break
-                        if is_in_table: continue
+                        if any(block_rect.intersect(t_rect).get_area() > block_rect.get_area() * 0.5 for t_rect in table_bboxes):
+                            continue
 
                         for line in b["lines"]:
                             line_text = "".join([span["text"] for span in line["spans"]]).strip()
@@ -119,47 +112,58 @@ class PdfMdConverter:
                             
                             bbox = line["bbox"]
                             y_center = (bbox[1] + bbox[3]) / 2
-                            
-                            # 获取该行最大字号
                             line_font_size = max([span["size"] for span in line["spans"]])
                             
-                            # === 智能判别逻辑 ===
+                            # === 智能判别逻辑 (V7.0) ===
                             is_top = y_center < page_height * 0.20
                             is_bottom = y_center > page_height * 0.80
-                            is_hf = False
+                            is_strict_zone = y_center < page_height * 0.08 or y_center > page_height * 0.92
                             
-                            # 🛡️ 核心防御：如果是正文字号，且不是高频词，强制认为是正文！
-                            # 容差 0.5pt (避免字体渲染微小差异)
-                            is_body_size = abs(line_font_size - body_font_size) < 0.5
+                            is_hf = False
                             clean_key = re.sub(r'[\d\s]+', '', line_text).lower()
                             
-                            # 判定条件 1: 高频词匹配 (且必须在边缘)
-                            if (is_top or is_bottom) and clean_key in hf_candidates:
+                            # ✂️ 粘连解离检测 (Partial Match)
+                            # 检查这行字是否以某个页眉特征开头？如果是，说明粘连了
+                            matched_candidate = None
+                            if is_top:
+                                for cand in hf_candidates:
+                                    # 简单检查：如果 clean_key 包含 candidate
+                                    if cand in clean_key and len(cand) > 3: 
+                                        matched_candidate = cand
+                                        break
+                            
+                            if matched_candidate:
+                                # 这是一个混合行 (页眉+正文)，我们需要极其小心
+                                # 简单策略：如果整行都很短，或者主要由页眉组成，就视为页眉删掉
+                                # 如果很长，可能是正文，这里为了安全，若位于严格边缘，倾向于删除
+                                is_hf = True
+                            elif clean_key in hf_candidates:
                                 is_hf = True
                             
-                            # 判定条件 2: 页码正则 (页码通常字号较小，或者位置很偏)
-                            if (is_top or is_bottom):
+                            # 正则匹配页码
+                            if not is_hf and (is_top or is_bottom):
                                 for pattern in PAGE_NUM_PATTERNS:
                                     if re.match(pattern, line_text, re.IGNORECASE):
                                         is_hf = True
                                         break
                             
-                            # 🛡️ 触发熔断：如果是正文字号，且没命中高频词库，取消页眉判定
-                            if is_hf and is_body_size and clean_key not in hf_candidates:
-                                # 但要注意，纯数字页码有时字号跟正文一样，这里要特判
+                            # 🛡️ 正文保护 (Body Guard)
+                            # 如果字号是正文大小，且不在绝对禁区(8%)，且不是完全匹配的高频词 -> 它是正文
+                            is_body_size = abs(line_font_size - body_font_size) < 0.5
+                            if is_hf and is_body_size and not is_strict_zone and clean_key not in hf_candidates:
+                                # 可能是被正则误判的页码 (如 "1." 这种序号)
                                 if not re.match(r'^\d+$', line_text): 
-                                    is_hf = False 
+                                    is_hf = False
                             
                             # 执行分类
                             if is_hf:
                                 if is_top: extracted_headers.add(line_text)
                                 if is_bottom and not re.match(r'^[\d\s\/\-]+$', line_text):
                                     extracted_footers.add(line_text)
-                                continue # 确认为页眉，跳过正文写入
+                                continue 
                             
                             # === 正文写入 ===
                             prefix = ""
-                            # 标题判定 (比正文大 4pt 为一级，大 1.5pt 为二级)
                             if line_font_size >= body_font_size + 4: prefix = "# "
                             elif line_font_size >= body_font_size + 1.5: prefix = "## "
                             elif line_font_size >= body_font_size + 0.5:
@@ -171,10 +175,35 @@ class PdfMdConverter:
                                 "content": f"{prefix}{line_text}"
                             })
 
-                # 排序合并
+                # 排序并合并
                 page_elements.sort(key=lambda x: x["y"])
                 for el in page_elements:
                     md_content += el["content"] + "\n\n"
+
+            # --- 步骤 C: 最终清洗 (Post-Processing) ---
+            # 有时候 PyMuPDF 提取顺序问题导致页码夹在中间，用正则最后扫一遍
+            lines = md_content.split('\n')
+            clean_lines = []
+            for line in lines:
+                strip_line = line.strip().replace('*', '') # 去掉 markdown 标记再检查
+                is_noise = False
+                
+                # 再次检查是否为纯页码残留
+                for pattern in PAGE_NUM_PATTERNS:
+                    if re.match(pattern, strip_line, re.IGNORECASE):
+                        is_noise = True
+                        break
+                
+                # 再次检查是否为高频页眉残留
+                if not is_noise:
+                    k = re.sub(r'[\d\s]+', '', strip_line).lower()
+                    if k in hf_candidates:
+                        is_noise = True
+
+                if not is_noise:
+                    clean_lines.append(line)
+            
+            md_content = "\n".join(clean_lines)
 
             # --- 收尾 ---
             final_header = max(extracted_headers, key=len) if extracted_headers else ""
