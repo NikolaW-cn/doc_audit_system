@@ -1,7 +1,7 @@
 import fitz  # PyMuPDF
 import os
 import re
-import frontmatter  # 需要安装 python-frontmatter
+import frontmatter
 from markdown import markdown
 from weasyprint import HTML, CSS
 from collections import Counter
@@ -11,135 +11,152 @@ class PdfMdConverter:
         pass
 
     # =========================================================================
-    # 1. PDF -> Markdown 
-    # 功能：智能分离页眉页脚到元数据，正文保留标题层级，不做人为内容过滤
+    # 1. PDF -> Markdown (忠实还原版)
+    # 特点：只分离页眉页脚和表格，除此之外的正文内容（含错误提示、点点点）一律保留
     # =========================================================================
     def pdf_to_markdown(self, pdf_path, output_path):
         try:
             doc = fitz.open(pdf_path)
             total_pages = len(doc)
             
-            # --- 阶段一：全文档扫描 (分析字体大小 + 识别页眉页脚) ---
-            
-            # 1. 统计字体大小 (用于判定正文和标题)
-            all_font_sizes = []
-            # 2. 统计文本频率 (用于判定页眉页脚)
+            # --- 步骤 1: 识别页眉页脚 (通过位置+频率) ---
+            # 我们先扫描全书，看看哪些文字总是出现在页面边缘
             text_frequency = Counter()
-            # 3. 缓存所有块 (避免二次读取文件)
-            all_pages_blocks = []
-
+            
             for page in doc:
                 page_height = page.rect.height
-                # 获取页面所有文本块 (包含位置信息)
                 blocks = page.get_text("dict")["blocks"]
-                all_pages_blocks.append(blocks)
-                
                 for b in blocks:
-                    if b['type'] == 0: # 0代表文本
-                        # 收集字号
+                    if b['type'] == 0: # 文本块
+                        for line in b["lines"]:
+                            text = "".join([span["text"] for span in line["spans"]]).strip()
+                            if len(text) < 1: continue # 只有完全为空的才跳过
+                            
+                            bbox = line["bbox"]
+                            y_center = (bbox[1] + bbox[3]) / 2
+                            
+                            # 判定区域：页面最上方 12% 和最下方 12%
+                            if y_center < page_height * 0.12 or y_center > page_height * 0.88:
+                                # 简单归一化统计 (去掉数字差异，比如 Page 1 和 Page 2 归为一类)
+                                clean_key = re.sub(r'\d+', '', text.strip())
+                                text_frequency[clean_key] += 1
+
+            # 出现频率超过 30% 的边缘文本，被认定为“固定页眉/页脚”
+            header_footer_candidates = {
+                key for key, count in text_frequency.items() 
+                if count > (total_pages * 0.3)
+            }
+            
+            # --- 步骤 2: 逐页提取 (保留所有细节) ---
+            md_content = ""
+            extracted_headers = set()
+            extracted_footers = set()
+            
+            # 统计字号用于判定标题
+            all_font_sizes = []
+            for page in doc:
+                for b in page.get_text("dict")["blocks"]:
+                    if b['type'] == 0:
                         for line in b["lines"]:
                             for span in line["spans"]:
                                 all_font_sizes.append(round(span["size"], 1))
-                        
-                        # 收集文本频率 (仅统计位于页面顶部15%或底部15%的内容)
-                        text = "".join([span["text"] for line in b["lines"] for span in line["spans"]]).strip()
-                        bbox = b["bbox"]
-                        is_edge = (bbox[1] < page_height * 0.15) or (bbox[3] > page_height * 0.85)
-                        
-                        if text and is_edge:
-                            # 简单去空处理，提高匹配率
-                            clean_key = re.sub(r'\s+', '', text)
-                            text_frequency[clean_key] += 1
-
-            # 计算正文基准字号 (出现次数最多的字号)
+            
             if all_font_sizes:
                 body_font_size = Counter(all_font_sizes).most_common(1)[0][0]
             else:
                 body_font_size = 10.5
-            
-            print(f"📊 分析结果：正文基准字号={body_font_size}pt")
 
-            # 确定哪些是页眉页脚 (规则：位于边缘区域，且在超过 60% 的页面中都出现过)
-            header_footer_candidates = {
-                key for key, count in text_frequency.items() 
-                if count > (total_pages * 0.6)
-            }
-            
-            # --- 阶段二：逐页提取与转换 ---
-            
-            md_content = ""
-            extracted_headers = set() # 收集具体的页眉文本
-            extracted_footers = set() # 收集具体的页脚文本
+            # 定义页码的正则 (用于捕捉变动页码，将其移至元数据，不留在正文)
+            PAGE_NUM_PATTERNS = [
+                r'^\d+$', r'^Page\s*\d+', r'^\d+\s*[\/\|]\s*\d+$', r'^\-\s*\d+\s*\-$',
+                r'^\d+\s*of\s*\d+$'
+            ]
 
-            for i, blocks in enumerate(all_pages_blocks):
-                page_height = doc[i].rect.height
+            for page in doc:
+                page_height = page.rect.height
                 
-                # 按垂直坐标 Y 排序，确保阅读顺序正确
-                blocks.sort(key=lambda b: b["bbox"][1])
+                # A. 优先提取表格 (防止表格被打散)
+                tables = page.find_tables()
+                table_bboxes = [fitz.Rect(tab.bbox) for tab in tables]
+                # 将表格转为 Markdown 文本
+                page_tables_md = {tab.bbox[1]: tab.to_markdown() for tab in tables}
+
+                # B. 提取文本
+                blocks = page.get_text("dict")["blocks"]
+                page_elements = []
+
+                # 先把表格加入队列
+                for y, md_text in page_tables_md.items():
+                    page_elements.append({"y": y, "type": "table", "content": md_text})
 
                 for b in blocks:
                     if b['type'] == 0:
-                        bbox = b["bbox"]
-                        
-                        # 1. 提取当前块的纯文本和最大字号
-                        block_text = ""
-                        max_size = 0
+                        # 检查是否在表格区域内
+                        block_rect = fitz.Rect(b["bbox"])
+                        # 如果文本块重心在表格里，就跳过 (因为已经被表格引擎提取了)
+                        if any(block_rect.intersect(t_rect).get_area() > block_rect.get_area() * 0.5 for t_rect in table_bboxes):
+                            continue
+
                         for line in b["lines"]:
-                            for span in line["spans"]:
-                                block_text += span["text"]
-                                if span["size"] > max_size:
-                                    max_size = span["size"]
-                        
-                        raw_text = block_text.strip()
-                        if not raw_text: continue
+                            line_text = "".join([span["text"] for span in line["spans"]]).strip()
+                            if not line_text: continue
+                            
+                            bbox = line["bbox"]
+                            y_center = (bbox[1] + bbox[3]) / 2
+                            is_top = y_center < page_height * 0.15
+                            is_bottom = y_center > page_height * 0.85
+                            
+                            # === 页眉页脚判定 (仅做移动，不删除) ===
+                            is_hf = False
+                            clean_key = re.sub(r'\d+', '', line_text.strip())
+                            
+                            # 1. 命中固定高频词
+                            if (is_top or is_bottom) and clean_key in header_footer_candidates:
+                                is_hf = True
+                            
+                            # 2. 命中页码格式 (即使频率不高)
+                            if (is_top or is_bottom):
+                                for pattern in PAGE_NUM_PATTERNS:
+                                    if re.match(pattern, line_text, re.IGNORECASE):
+                                        is_hf = True
+                                        break
+                            
+                            if is_hf:
+                                if is_top: extracted_headers.add(line_text)
+                                if is_bottom: 
+                                    # 纯数字页码不存入 footer_text (因为还原时会自动生成)
+                                    # 但如果是 "Page 1 / 10" 这种复杂格式，还是存一下比较稳
+                                    if not re.match(r'^\d+$', line_text):
+                                        extracted_footers.add(line_text)
+                                continue # 移入元数据，正文跳过
+                            
+                            # === 正文样式处理 ===
+                            # 没有任何过滤逻辑！保留错误信息、点点点等
+                            
+                            # 计算这一行的最大字号
+                            max_size = max([span["size"] for span in line["spans"]])
+                            prefix = ""
+                            
+                            if max_size >= body_font_size + 4: prefix = "# "
+                            elif max_size >= body_font_size + 1.5: prefix = "## "
+                            elif max_size >= body_font_size + 0.5:
+                                if not line_text.startswith("**"): line_text = f"**{line_text}**"
 
-                        # 2. 判断是否为页眉/页脚 (如果是，存入元数据，不写进正文)
-                        check_key = re.sub(r'\s+', '', raw_text)
-                        is_top = bbox[1] < page_height * 0.15
-                        is_bottom = bbox[3] > page_height * 0.85
-                        
-                        if check_key in header_footer_candidates:
-                            if is_top:
-                                extracted_headers.add(raw_text)
-                                continue # 跳过写入
-                            if is_bottom:
-                                extracted_footers.add(raw_text)
-                                continue # 跳过写入
+                            page_elements.append({
+                                "y": bbox[1],
+                                "type": "text",
+                                "content": f"{prefix}{line_text}"
+                            })
 
-                        # 3. 标题样式判定 (基于字号)
-                        prefix = ""
-                        # 一级标题：比正文大 4pt
-                        if max_size >= body_font_size + 4:
-                            prefix = "# "
-                        # 二级标题：比正文大 1.5pt
-                        elif max_size >= body_font_size + 1.5:
-                            prefix = "## "
-                        # 粗体/小标题：比正文略大
-                        elif max_size >= body_font_size + 0.5:
-                            # 如果还没加粗，给它加上
-                            if not raw_text.startswith("**"):
-                                raw_text = f"**{raw_text}**"
+                # C. 排序并合并
+                page_elements.sort(key=lambda x: x["y"])
+                for el in page_elements:
+                    md_content += el["content"] + "\n\n"
 
-                        # 4. 写入 Markdown (保留所有符号，不清洗)
-                        # 为了模拟段落间距，加两个换行
-                        if prefix:
-                            md_content += f"\n\n{prefix}{raw_text}\n\n"
-                        else:
-                            # 普通正文
-                            md_content += f"{raw_text}\n\n"
-
-            # --- 阶段三：保存文件 (带 YAML 头信息) ---
-            
-            # 选取最长的一个作为代表 (防止有时候页眉提取不完整)
+            # --- 步骤 3: 写入文件 ---
             final_header = max(extracted_headers, key=len) if extracted_headers else ""
             final_footer = max(extracted_footers, key=len) if extracted_footers else ""
             
-            # 过滤掉纯页码 (如 "1/7")，我们会在生成PDF时自动加页码，不需要手动保留
-            # 如果页脚包含文字+页码，我们尽量保留文字部分
-            if re.match(r'^[\d\s/ofpage页]+$', final_footer, re.I):
-                final_footer = "" # 纯页码直接清空，由CSS生成
-
-            # 构建 FrontMatter 对象
             post = frontmatter.Post(md_content)
             post['title'] = os.path.basename(pdf_path)
             post['header_text'] = final_header
@@ -148,22 +165,19 @@ class PdfMdConverter:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
                 
-            print(f"✅ PDF->MD 成功。提取页眉: [{final_header}] | 页脚: [{final_footer}]")
             return True
 
         except Exception as e:
-            print(f"❌ PDF转MD失败: {e}")
+            print(f"❌ 转换失败: {e}")
             import traceback
             traceback.print_exc()
             return False
 
     # =========================================================================
-    # 2. Markdown -> PDF
-    # 功能：读取 YAML 元数据还原页眉页脚，利用 CSS 还原标题样式
+    # 2. Markdown -> PDF (样式还原版)
     # =========================================================================
     def markdown_to_pdf(self, md_path, output_path):
         try:
-            # 1. 读取 MD 内容和 YAML 头信息
             with open(md_path, "r", encoding="utf-8") as f:
                 post = frontmatter.load(f)
             
@@ -171,32 +185,27 @@ class PdfMdConverter:
             header_text = post.get('header_text', '')
             footer_text = post.get('footer_text', '')
             
-            # 2. 转换正文为 HTML
-            # 启用表格扩展，防止表格转换乱码
+            # 开启表格支持
             html_body = markdown(body_text, extensions=['tables', 'fenced_code'])
 
-            # 3. 核心样式还原 (CSS)
-            # 重点：@page 用于控制页眉页脚，h1/h2 用于控制标题样式
             css_string = f'''
                 @page {{
                     size: A4;
-                    margin: 2.5cm; /* 设置页边距，给页眉页脚留空间 */
+                    margin: 2.5cm;
                     
-                    /* --- 还原页眉 --- */
                     @top-center {{
                         content: "{header_text}";
                         font-family: "Microsoft YaHei", "SimHei", sans-serif;
                         font-size: 9pt;
                         color: #666;
-                        border-bottom: 1px solid #ddd; /* 增加下划线，看起来更像页眉 */
+                        border-bottom: 1px solid #ddd;
                         padding-bottom: 5px;
                         margin-bottom: 20px;
-                        white-space: pre-wrap; /* 保留换行 */
+                        white-space: pre-wrap; 
                     }}
                     
-                    /* --- 还原页脚 (左侧文字 + 右侧页码) --- */
                     @bottom-center {{
-                        content: "{footer_text}  " counter(page); /* 自动添加页码 */
+                        content: "{footer_text}  " counter(page);
                         font-family: "Microsoft YaHei", "SimHei", sans-serif;
                         font-size: 9pt;
                         color: #666;
@@ -206,82 +215,42 @@ class PdfMdConverter:
                     }}
                 }}
 
-                /* --- 全局样式 --- */
                 body {{
-                    font-family: "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", sans-serif;
-                    font-size: 10.5pt; /* 标准五号字 */
+                    font-family: "Microsoft YaHei", "SimHei", sans-serif;
+                    font-size: 10.5pt;
                     line-height: 1.6;
                     color: #333;
-                    text-align: justify; /* 两端对齐 */
-                }}
-
-                /* --- 标题样式还原 (对应 PDF 提取时的逻辑) --- */
-                h1 {{ 
-                    font-size: 22pt;      /* 对应 # */
-                    font-weight: bold; 
-                    color: #000;
-                    text-align: center;   /* 一级标题通常居中 */
-                    margin-top: 2em;
-                    margin-bottom: 1em;
+                    text-align: justify;
                 }}
                 
-                h2 {{ 
-                    font-size: 16pt;      /* 对应 ## */
-                    font-weight: bold; 
-                    color: #333;
-                    margin-top: 1.5em;
-                    margin-bottom: 0.8em;
-                    border-left: 5px solid #007bff; /* 加上左边框，增加辨识度 */
-                    padding-left: 10px;
-                }}
+                h1 {{ font-size: 22pt; font-weight: bold; text-align: center; margin: 2em 0 1em; }}
+                h2 {{ font-size: 16pt; font-weight: bold; border-left: 5px solid #007bff; padding-left: 10px; margin: 1.5em 0 0.8em; }}
+                h3 {{ font-size: 14pt; font-weight: bold; margin-top: 1.2em; }}
                 
-                h3 {{
-                    font-size: 14pt;
-                    font-weight: bold;
-                    margin-top: 1.2em;
+                /* 表格还原样式 */
+                table {{ 
+                    border-collapse: collapse; 
+                    width: 100%; 
+                    margin: 1.5em 0;
+                    page-break-inside: auto;
                 }}
-
-                /* --- 其他元素 --- */
-                p {{
-                    margin-bottom: 0.8em;
-                }}
-                
-                table {{
-                    border-collapse: collapse;
-                    width: 100%;
-                    margin: 1em 0;
-                }}
-                
-                th, td {{
-                    border: 1px solid #999;
-                    padding: 6px;
-                    text-align: left;
+                th, td {{ 
+                    border: 1px solid #000; /* 还原为黑色边框，更清晰 */
+                    padding: 6px; 
+                    text-align: left; 
                     font-size: 10pt;
                 }}
+                th {{ background-color: #f2f2f2; font-weight: bold; }}
                 
-                th {{
-                    background-color: #f2f2f2;
-                    font-weight: bold;
-                }}
-                
-                /* 还原粗体 */
-                strong {{
-                    font-weight: bold;
-                    color: #000;
-                }}
+                /* 目录点点点优化 */
+                p {{ margin-bottom: 0.8em; }}
             '''
 
-            # 4. 生成 PDF
             html = HTML(string=html_body, base_url=".")
             css = CSS(string=css_string)
-            
             html.write_pdf(output_path, stylesheets=[css])
             
-            print(f"✅ MD->PDF 成功还原: {output_path}")
             return True
-
         except Exception as e:
-            print(f"❌ MD转PDF失败: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ 还原失败: {e}")
             return False

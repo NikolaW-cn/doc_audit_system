@@ -1,15 +1,30 @@
-pymupdf
+# === 核心 PDF 处理库 (必须 1.23.0 以上才支持表格提取) ===
+pymupdf>=1.23.0
+
+# === Markdown 与 格式转换 ===
 markdownify
 markdown
-weasyprint
-mammoth
-pdf2image
-pytesseract
-Pillow
-streamlit
-rapidocr_onnxruntime
-streamlit-pdf-viewer
 python-frontmatter
 PyYAML
+
+# === PDF 生成与预览 ===
+weasyprint
+streamlit-pdf-viewer
+
+# === OCR 与 图像处理 ===
+pdf2image
+Pillow
+rapidocr_onnxruntime
+# 如果在云端报错缺 cv2，可以把下面这行注释打开
+# opencv-python-headless
+
+# === Word 处理 ===
+mammoth
+
+# === Web 框架 ===
+streamlit
+
+# === 备用/遗留库 (如果不怎么用可以留着) ===
+pytesseract
 # paddleocr 
 # paddlepaddle
