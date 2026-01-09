@@ -1,130 +1,206 @@
-import os
-import sys
 import fitz  # PyMuPDF
-from markdownify import markdownify as md_converter
-import markdown
+import os
+import frontmatter  # 处理 YAML 头信息
+from markdown import markdown
 from weasyprint import HTML, CSS
-from contextlib import contextmanager
 
 class PdfMdConverter:
-    """
-    Step 1: PDF 和 Markdown 之间的相互转换
-    """
+    def __init__(self):
+        pass
 
+    # ==========================================
+    # 1. 智能提取：PDF -> Markdown (带样式和元数据)
+    # ==========================================
     def pdf_to_markdown(self, pdf_path, output_path):
         """
-        功能：将 PDF 转换为 Markdown
-        PDF -> HTML (保留排版结构) -> Markdown
+        将 PDF 转换为 Markdown，保留标题层级，提取页眉页脚到 YAML 头部
         """
-        # 检查文件是否存在
-        if not os.path.exists(pdf_path):
-            print(f"❌ 错误：找不到文件 {pdf_path}")
-            return False
-
-        print(f"🔄 [PDF -> MD] 正在转换: {os.path.basename(pdf_path)}")
-        
         try:
-            # 1. 打开 PDF
             doc = fitz.open(pdf_path)
-            full_html = ""
             
-            # 2. 逐页提取 HTML
+            # --- 1. 分析全文档的字体大小分布，确定什么是“正文”，什么是“标题” ---
+            font_counts = {}
             for page in doc:
-                full_html += page.get_text("html")
+                blocks = page.get_text("dict")["blocks"]
+                for b in blocks:
+                    if b['type'] == 0:  # 文本块
+                        for line in b["lines"]:
+                            for span in line["spans"]:
+                                size = round(span["size"], 1)
+                                font_counts[size] = font_counts.get(size, 0) + len(span["text"])
             
-            # 3. 将 HTML 转换为 Markdown
-            # heading_style="ATX" 表示使用 # ## ### 这种标题风格
-            # strip=['a'] 表示去除超链接标签但保留文字
-            md_text = md_converter(full_html, heading_style="ATX")
-            
-            # 4. 简单的清洗：去除连续的空行，让文档更紧凑
-            lines = md_text.splitlines()
-            # 过滤掉只有空白符的行，但保留必要的段落间隔
-            clean_lines = [line for line in lines if line.strip()] 
-            final_md = "\n\n".join(clean_lines)
+            # 出现频率最高的字体大小判定为“正文大小”
+            if font_counts:
+                body_font_size = max(font_counts, key=font_counts.get)
+            else:
+                body_font_size = 11.0
 
-            # 5. 保存文件
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(final_md)
+            print(f"📊 分析完毕：正文字体大小约为 {body_font_size}pt")
+
+            # --- 2. 逐页提取内容 ---
+            md_content = ""
+            headers_set = set() # 存储提取到的页眉
+            footers_set = set() # 存储提取到的页脚
             
-            print(f"✅ [成功] 已保存至: {output_path}")
+            page_height = 0
+
+            for page in doc:
+                page_height = page.rect.height
+                blocks = page.get_text("dict")["blocks"]
+                
+                # 按垂直位置排序
+                blocks.sort(key=lambda b: b["bbox"][1])
+
+                for b in blocks:
+                    if b['type'] == 0:
+                        bbox = b["bbox"]
+                        text_content = ""
+                        max_size = 0
+                        
+                        # 获取这一块的文本和最大字号
+                        for line in b["lines"]:
+                            for span in line["spans"]:
+                                text_content += span["text"]
+                                if span["size"] > max_size:
+                                    max_size = span["size"]
+                        
+                        text_content = text_content.strip()
+                        if not text_content: continue
+
+                        # === 判定页眉/页脚 ===
+                        # 规则：页面顶部 10% 为页眉，底部 10% 为页脚
+                        y0 = bbox[1] # 顶部坐标
+                        y1 = bbox[3] # 底部坐标
+                        
+                        if y1 < page_height * 0.1:
+                            headers_set.add(text_content)
+                            continue # 跳过，不写入正文
+                        elif y0 > page_height * 0.9:
+                            footers_set.add(text_content)
+                            continue # 跳过，不写入正文
+
+                        # === 判定标题 ===
+                        # 规则：比正文大 2pt 是二级标题，大 5pt 是一级标题
+                        prefix = ""
+                        if max_size > body_font_size + 5:
+                            prefix = "# "
+                        elif max_size > body_font_size + 2:
+                            prefix = "## "
+                        elif max_size > body_font_size + 0.5:
+                            prefix = "**" #稍微大一点的加粗
+                            if "**" not in text_content: # 防止重复
+                                text_content = f"{text_content}**"
+
+                        # 拼接 Markdown
+                        md_content += f"{prefix}{text_content}\n\n"
+
+            # --- 3. 构造带 YAML 头的 Markdown ---
+            # 取出现次数最多的页眉页脚（通常全书统一）
+            final_header = list(headers_set)[0] if headers_set else ""
+            final_footer = list(footers_set)[0] if footers_set else ""
+
+            post = frontmatter.Post(md_content)
+            post['header_text'] = final_header
+            post['footer_text'] = final_footer
+            post['title'] = os.path.basename(pdf_path)
+            
+            # 写入文件
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+                
+            print(f"✅ 转换完成。页眉：{final_header} | 页脚：{final_footer}")
             return True
 
         except Exception as e:
-            print(f"❌ [失败] PDF 转 Markdown 出错: {e}")
+            print(f"❌ PDF转MD失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
+    # ==========================================
+    # 2. 完美还原：Markdown -> PDF (样式还原 + 页眉页脚注入)
+    # ==========================================
     def markdown_to_pdf(self, md_path, output_path):
         """
-        功能：将 Markdown 转换为 PDF
-        原理：Markdown -> HTML (渲染) -> PDF (打印)
-        关键：使用 CSS 控制 PDF 的样式，支持高亮显示
+        读取 Markdown (包含YAML头)，生成带页眉页脚和标题样式的 PDF
         """
-        if not os.path.exists(md_path):
-            print(f"❌ 错误：找不到文件 {md_path}")
-            return False
-
-        print(f"🔄 [MD -> PDF] 正在转换: {os.path.basename(md_path)}")
-
         try:
-            # 1. 读取 Markdown 内容
+            # 1. 读取 MD 和 元数据
             with open(md_path, "r", encoding="utf-8") as f:
-                md_text = f.read()
+                post = frontmatter.load(f)
+            
+            body_text = post.content
+            header_text = post.get('header_text', '')
+            footer_text = post.get('footer_text', '')
+            
+            # 2. Markdown 转 HTML
+            html_body = markdown(body_text)
 
-            # 2. MD 转 HTML (开启表格支持)
-            html_body = markdown.markdown(md_text, extensions=['tables', 'fenced_code'])
+            # 3. 构建 CSS (核心魔法)
+            # 使用 CSS Paged Media 规范 (@page) 来控制页眉页脚
+            css_string = f'''
+                @page {{
+                    size: A4;
+                    margin: 2.5cm;
+                    
+                    /* 定义页眉区域 */
+                    @top-center {{
+                        content: "{header_text}";
+                        font-family: "Microsoft YaHei", "SimHei", sans-serif;
+                        font-size: 9pt;
+                        color: #666;
+                        border-bottom: 1px solid #ddd;
+                        padding-bottom: 5px;
+                    }}
+                    
+                    /* 定义页脚区域 (左边文字，右边页码) */
+                    @bottom-center {{
+                        content: "{footer_text}  |  第 " counter(page) " 页";
+                        font-family: "Microsoft YaHei", "SimHei", sans-serif;
+                        font-size: 9pt;
+                        color: #666;
+                        border-top: 1px solid #ddd;
+                        padding-top: 5px;
+                    }}
+                }}
 
-            # 3. 定义 PDF 样式
-            # 预埋了 .highlight 样式，未来大模型审核结果高亮时会用到
-            css_style = CSS(string='''
-                @page { size: A4; margin: 2.5cm; }
-                body { 
-                    /* 关键修改：增加了 "Noto Sans CJK SC" 和 "WenQuanYi Zen Hei" */
-                    font-family: "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei", sans-serif;
-                    font-size: 11pt; 
+                body {{
+                    font-family: "Microsoft YaHei", "SimHei", "Noto Sans CJK SC", sans-serif;
+                    font-size: 11pt;
                     line-height: 1.6;
                     color: #333;
-                }
-                /* ... 其他样式保持不变 ... */
-                h1, h2, h3 { color: #2c3e50; margin-top: 1em; }
-                h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }
-                table { 
-                    border-collapse: collapse; 
-                    width: 100%; 
-                    margin: 20px 0; 
-                    font-size: 10pt;
-                }
-                th, td { 
-                    border: 1px solid #dfe2e5; 
-                    padding: 8px 12px; 
-                }
-                th { background-color: #f8f9fa; font-weight: bold; }
-                pre { background: #f6f8fa; padding: 10px; border-radius: 4px; }
-                code { font-family: Consolas, monospace; background: #f0f0f0; padding: 2px 4px; }
-                mark, .highlight { 
-                    background-color: #ffe066; 
-                    padding: 2px 0;
-                    border-radius: 2px;
-                }
-            ''')
+                }}
 
-            # 4. 组装完整的 HTML 页面
-            final_html = f"""
-            <!DOCTYPE html>
-            <html>
-            <head><meta charset="utf-8"></head>
-            <body>
-            {html_body}
-            </body>
-            </html>
-            """
+                /* 标题样式还原 */
+                h1 {{ 
+                    font-size: 24pt; 
+                    font-weight: bold; 
+                    color: #2c3e50; 
+                    border-bottom: 2px solid #eee; 
+                    margin-top: 20px;
+                }}
+                h2 {{ 
+                    font-size: 18pt; 
+                    font-weight: bold; 
+                    color: #34495e; 
+                    margin-top: 15px;
+                    padding-left: 10px;
+                    border-left: 4px solid #007bff;
+                }}
+                p {{ margin-bottom: 10px; }}
+            '''
 
-            # 5. 生成 PDF
-            HTML(string=final_html).write_pdf(output_path, stylesheets=[css_style])
+            # 4. 生成 PDF
+            html = HTML(string=html_body, base_url=".")
+            css = CSS(string=css_string)
             
-            print(f"✅ [成功] 已保存至: {output_path}")
+            html.write_pdf(output_path, stylesheets=[css])
+            
+            print(f"✅ PDF还原成功: {output_path}")
             return True
 
         except Exception as e:
-            print(f"❌ [失败] Markdown 转 PDF 出错: {e}")
+            print(f"❌ MD转PDF失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
